@@ -18,6 +18,24 @@ from PIL import Image
 if not os.path.exists("outs"):
     os.mkdir("outs")
 
+class RangeShuffler:
+    def __init__(self, minval, maxval):
+        self.minval = minval
+        self.maxval = maxval
+        self.current = tf.zeros(shape=[0],dtype=tf.int64)
+    
+    def new_shuffled(self):
+        newrange = tf.random.shuffle(tf.range(start=self.minval, limit=self.maxval, dtype=tf.int64))
+        self.current = tf.concat([self.current, newrange],axis=-1)
+    
+    def get_batch(self,batch_size):
+        while self.current.shape[0] < batch_size:
+            self.new_shuffled()
+    
+        ret = self.current[:batch_size]
+        self.current = self.current[batch_size:]
+        return ret
+
 #returns float32, pixel colors in range [-1.0,1.0]
 def get_mnist_pics_only():
     (x,_),(y,_) = tf.keras.datasets.mnist.load_data()
@@ -32,12 +50,14 @@ prm['SIZE_X'] = dataset.shape[-2]
 prm['CHANNELS'] = dataset.shape[-1]
 prm['IMAGE_SIZE'] = prm['SIZE_Y']*prm['SIZE_X']*prm['CHANNELS']
 prm['LAYERS'] = 6
-prm['MODEL_SIZE'] = 256
+prm['MODEL_SIZE'] = 128
 prm['BATCH_SIZE'] = 32
-prm['LEARNING_RATE'] = 0.00005
+prm['LEARNING_RATE'] = 0.0005
+prm['LEARNING_RATE_MIN'] = 0.00001
 prm['ADAM_EPSILON'] = 1e-4
-prm['N_TEST_GENERATIONS'] = 25
+prm['N_TEST_GENERATIONS'] = 49
 prm['FILTER_SIZE'] = 3
+prm['USE_RANGE_SHUFFLER'] = True
 
 for key in prm:
     print(f"{key}={prm[key]} ",end="")
@@ -91,7 +111,6 @@ class NoisePredictorConv(tf.keras.Model):
         self.convs = [tf.keras.layers.Conv2D(prm['MODEL_SIZE'], (prm['FILTER_SIZE'],prm['FILTER_SIZE']), activation=tf.nn.gelu, padding='valid') for _ in range(prm['LAYERS'])]
         self.epilogue = tf.keras.layers.Conv2D(prm['CHANNELS'], (1,1), use_bias=False)
 
-
     def call(self, data, timestep_ns):
         #data shape:        BATCH, SIZEY, SIZEX, CHANNELS
         #timestep_ns shape: BATCH
@@ -121,7 +140,15 @@ class NoisePredictorConv(tf.keras.Model):
         output = self.epilogue(output)
         return output
         
-optimizer = tf.keras.optimizers.Adam(learning_rate=prm['LEARNING_RATE'],amsgrad=True,epsilon=prm['ADAM_EPSILON'])
+step=1
+
+def lr_scheduler():
+    global step
+    minimum = prm['LEARNING_RATE_MIN']
+    calculated = prm['LEARNING_RATE']*(2.0**(-step/3000.0))
+    return max(minimum,calculated)
+
+optimizer = tf.keras.optimizers.Adam(learning_rate=lr_scheduler,amsgrad=True,epsilon=prm['ADAM_EPSILON'])
 noising_process = NoisingProcess(prm['N_STEPS'])
 noise_predictor = NoisePredictorConv()
 
@@ -160,16 +187,23 @@ def gridify(allpics):
 training_sess_id = str(random.randrange(1000000000))
 
 losses = []
-step=1
+
+if prm['USE_RANGE_SHUFFLER']:
+    data_shuffler = RangeShuffler(0,dataset.shape[0])
+    timestep_shuffler = RangeShuffler(1,prm['N_STEPS']+1)
 
 starttime = time.time()
 
 #training loop:
 while True:
-    ids = tf.random.uniform(shape=[prm['BATCH_SIZE']], maxval=dataset.shape[0], dtype=tf.int64)
-    originals = tf.gather(dataset, ids)
+    if prm['USE_RANGE_SHUFFLER']:
+        ids = data_shuffler.get_batch(prm['BATCH_SIZE'])
+        timestep_ids = timestep_shuffler.get_batch(prm['BATCH_SIZE'])
+    else:
+        ids = tf.random.uniform(shape=[prm['BATCH_SIZE']], maxval=dataset.shape[0], dtype=tf.int64)
+        timestep_ids = tf.random.uniform(shape=[prm['BATCH_SIZE']], minval=1, maxval=prm['N_STEPS']+1, dtype=tf.int64)
     
-    timestep_ids = tf.random.uniform(shape=[prm['BATCH_SIZE']], minval=1, maxval=prm['N_STEPS']+1, dtype=tf.int64)
+    originals = tf.gather(dataset, ids)
     
     targets = []
     batch = []
@@ -194,7 +228,7 @@ while True:
         
         print(f"{totaltime} {step} {step*prm['BATCH_SIZE']} ",end="")
         
-        print(f"{losses.numpy()}",end="")
+        print(f"{losses.numpy()} {lr_scheduler()}",end="")
         print()
         losses = []
         
@@ -206,8 +240,8 @@ while True:
             for ts in range(prm['N_STEPS'], 0, -1):
                 ts_tf = tf.expand_dims(tf.convert_to_tensor(ts),axis=0)
                 ts_tf = tf.broadcast_to(ts_tf,[n_gen])
-                output = picture-noise_predictor(picture, ts_tf)*noising_process.get_noise_stddev_for_step(ts)
-                picture,_ = noising_process.direct(ts-1, output)
+                picture -= noise_predictor(picture, ts_tf)*noising_process.get_noise_stddev_for_step(ts)
+                picture,_ = noising_process.direct(ts-1, picture)
             
             picture = gridify(picture)
             picture = tf.cast(tf.clip_by_value(((picture+1.0)*0.5)*255.0,0.0,255.0),dtype=tf.uint8)
