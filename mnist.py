@@ -40,8 +40,20 @@ class RangeShuffler:
 def get_mnist_pics_only():
     (x,_),(y,_) = tf.keras.datasets.mnist.load_data()
     return tf.expand_dims(tf.cast(tf.concat([x,y],axis=0),dtype=tf.float32)*(1.0/255.0)*2.0-1.0,axis=-1)
+import glob
 
-dataset = get_mnist_pics_only()
+def get_pngs_from_directory(directory):
+    pngs = glob.glob(f"{directory}/*.png")
+    imgs = [tf.io.decode_png(tf.io.read_file(png)) for png in pngs]
+    imgs = tf.stack(imgs,axis=0)
+    imgs = tf.cast(imgs,dtype=tf.float32)*(1.0/255.0)*2.0-1.0
+    return imgs
+
+#dataset = get_mnist_pics_only()
+dataset = get_pngs_from_directory("Q:\\doom\\out")
+dataset_stddev = tf.math.reduce_std(dataset)
+dataset_mean = tf.math.reduce_mean(dataset)
+dataset = (dataset-dataset_mean)/dataset_stddev
 
 prm = {} #parameters
 prm['N_STEPS'] = 99 #how many diffusion steps we use
@@ -52,12 +64,15 @@ prm['IMAGE_SIZE'] = prm['SIZE_Y']*prm['SIZE_X']*prm['CHANNELS']
 prm['LAYERS'] = 6
 prm['MODEL_SIZE'] = 128
 prm['BATCH_SIZE'] = 32
-prm['LEARNING_RATE'] = 0.0005
-prm['LEARNING_RATE_MIN'] = 0.00001
+prm['LEARNING_RATE_START'] = 0.001
+prm['LEARNING_RATE_MIN'] = 0.0001
 prm['ADAM_EPSILON'] = 1e-4
-prm['N_TEST_GENERATIONS'] = 49
+prm['N_TEST_GENERATIONS'] = 16
 prm['FILTER_SIZE'] = 3
 prm['USE_RANGE_SHUFFLER'] = True
+prm['PRINT_TIME'] = 32 #how many steps between prints
+prm['GENERATE_TIME'] = prm['PRINT_TIME']*8 # how many steps between generated outputs saved to .png
+prm['USE_TIMESTEP_EMBEDDINGS'] = False
 
 for key in prm:
     print(f"{key}={prm[key]} ",end="")
@@ -67,8 +82,10 @@ class NoisingProcess:
     def __init__(self, timesteps):
         self.timesteps = timesteps
         
-        self.image_coef = tf.linspace(start=1.0, stop=0.0, num=timesteps+1)
-        self.noise_coef = tf.linspace(start=0.0, stop=1.0, num=timesteps+1)
+        #sqrt() so that when we add the two kinds of noise together,
+        #we get an image that has stddev=1
+        self.image_coef = tf.math.sqrt(tf.linspace(start=1.0, stop=0.0, num=timesteps+1))
+        self.noise_coef = tf.math.sqrt(tf.linspace(start=0.0, stop=1.0, num=timesteps+1))
 
     def direct(self, step, image, noise=None):
         assert step>=0 and step<=self.timesteps
@@ -81,6 +98,9 @@ class NoisingProcess:
         
     def get_noise_stddev_for_step(self, step):
         return self.noise_coef[step]
+        
+    def get_image_stddev_for_step(self, step):
+        return self.image_coef[step]
 
 
 def reduce(matrix, axis):
@@ -99,6 +119,12 @@ def pad_image_repeat(img, amount):
     img = tf.concat([top,img,bottom],axis=1)
     return img
 
+def normalize_features(x):
+    oldshape = x.shape
+    x = tf.reshape(x,[x.shape[0],-1,x.shape[3]])
+    x = reduce(x, axis=-2)
+    x = tf.reshape(x,oldshape)
+    return x
 
 class NoisePredictorConv(tf.keras.Model):
     def __init__(self):
@@ -117,27 +143,34 @@ class NoisePredictorConv(tf.keras.Model):
         
         orig_shape = data.shape
         
+        output = data
+        output = self.prologue(output)
+        
+        if prm['USE_TIMESTEP_EMBEDDINGS']:
+            timesteps = tf.gather(self.timestep_posenc, timestep_ns)
+            #shape: BATCH, MODEL_SIZE
+            timesteps = tf.expand_dims(timesteps,axis=1)
+            timesteps = tf.expand_dims(timesteps,axis=1)
+            #shape: BATCH, 1, 1, MODEL_SIZE
+            output += timesteps
+
         image_posenc = self.image_posenc(tf.range(prm['SIZE_X']*prm['SIZE_Y'],dtype=tf.int64))
         #image_posenc shape: 784, 256
         image_posenc = tf.reshape(image_posenc, [1,prm['SIZE_Y'],prm['SIZE_X'],prm['MODEL_SIZE']])
         #image_posenc shape: 1, 28, 28, 256
-        
-        
-        timesteps = tf.gather(self.timestep_posenc, timestep_ns)
-        #shape: BATCH, MODEL_SIZE
-        timesteps = tf.expand_dims(timesteps,axis=1)
-        timesteps = tf.expand_dims(timesteps,axis=1)
-        #shape: BATCH, 1, 1, MODEL_SIZE
-        output = data
-        output = self.prologue(output)
-        output += timesteps
         #20.0 is an arbitrary constant to make it actually see the posenc.
         #i want to normalize these things somehow at some point.
-        output += image_posenc*20.0 
+        output += image_posenc*20.0
+
+        output = normalize_features(output)
+
         for layer in self.convs:
             output = pad_image_repeat(output, prm['FILTER_SIZE']//2)
             output = layer(output)
+            output = normalize_features(output)
         output = self.epilogue(output)
+        
+        output = normalize_features(output)
         return output
         
 step=1
@@ -145,7 +178,7 @@ step=1
 def lr_scheduler():
     global step
     minimum = prm['LEARNING_RATE_MIN']
-    calculated = prm['LEARNING_RATE']*(2.0**(-step/3000.0))
+    calculated = prm['LEARNING_RATE_START']*(2.0**(-step/5000.0))
     return max(minimum,calculated)
 
 optimizer = tf.keras.optimizers.Adam(learning_rate=lr_scheduler,amsgrad=True,epsilon=prm['ADAM_EPSILON'])
@@ -153,20 +186,16 @@ noising_process = NoisingProcess(prm['N_STEPS'])
 noise_predictor = NoisePredictorConv()
 
 @tf.function
-def do_step(inputdata, timesteps, target, training):
+def do_step(inputdata, timesteps, target):
     losses = []
     
-    if training:
-        with tf.GradientTape() as tape:
-            output = noise_predictor(inputdata, timesteps)
-            loss = tf.reduce_mean(tf.square(target-output))
-            losses.append(loss)
-        gradients = tape.gradient(losses, noise_predictor.trainable_variables, unconnected_gradients=tf.UnconnectedGradients.ZERO)
-        optimizer.apply_gradients(zip(gradients, noise_predictor.trainable_variables))
-    else:
-        #TODO: not implemented yet
-        pass
-        
+    with tf.GradientTape() as tape:
+        output = noise_predictor(inputdata, timesteps)
+        loss = tf.reduce_mean(tf.square(target-output))
+        losses.append(loss)
+    gradients = tape.gradient(losses, noise_predictor.trainable_variables, unconnected_gradients=tf.UnconnectedGradients.ZERO)
+    optimizer.apply_gradients(zip(gradients, noise_predictor.trainable_variables))
+
     return losses
 
 #organize pictures in a neat grid
@@ -178,10 +207,10 @@ def gridify(allpics):
     total = height*width
     missing = total-n_pics
     if missing > 0:
-        allpics = tf.concat([allpics,tf.zeros(shape=[missing,allpics.shape[-3],allpics.shape[-2]])],axis=0)
-    allpics = tf.reshape(allpics, shape=[height, width, allpics.shape[-3],allpics.shape[-2]])
-    allpics = tf.transpose(allpics, [0,2,1,3])
-    allpics = tf.reshape(allpics, shape=[allpics.shape[0]*allpics.shape[1], allpics.shape[2]*allpics.shape[3]])
+        allpics = tf.concat([allpics,tf.zeros(shape=[missing,allpics.shape[-3],allpics.shape[-2],allpics.shape[-1]])],axis=0)
+    allpics = tf.reshape(allpics, shape=[height, width, allpics.shape[-3],allpics.shape[-2],allpics.shape[-1]])
+    allpics = tf.transpose(allpics, [0,2,1,3,4])
+    allpics = tf.reshape(allpics, shape=[allpics.shape[0]*allpics.shape[1], allpics.shape[2]*allpics.shape[3],allpics.shape[4]])
     return allpics
 
 training_sess_id = str(random.randrange(1000000000))
@@ -217,9 +246,9 @@ while True:
     batch = tf.stack(batch,axis=0)
     targets = tf.stack(targets,axis=0)
     
-    losses.extend(do_step(batch, timestep_ids, targets, training=True))
+    losses.extend(do_step(batch, timestep_ids, targets))
     
-    if step%128 == 0:
+    if step % prm['PRINT_TIME'] == 0:
     
         totaltime = time.time()-starttime
         starttime = time.time()
@@ -232,7 +261,7 @@ while True:
         print()
         losses = []
         
-        if step % 1024 == 0:
+        if step % prm['GENERATE_TIME'] == 0:
             #we generate pictures from noise here
             n_gen = prm['N_TEST_GENERATIONS']
 
@@ -241,10 +270,22 @@ while True:
                 ts_tf = tf.expand_dims(tf.convert_to_tensor(ts),axis=0)
                 ts_tf = tf.broadcast_to(ts_tf,[n_gen])
                 picture -= noise_predictor(picture, ts_tf)*noising_process.get_noise_stddev_for_step(ts)
+                
+                pictureshape = picture.shape
+                picture = tf.reshape(picture,[picture.shape[0],-1])
+                picture = reduce(picture, axis=-1)
+                picture = tf.reshape(picture,pictureshape)
+                
+                picture *= noising_process.get_image_stddev_for_step(ts-1)
+                
                 picture,_ = noising_process.direct(ts-1, picture)
             
+            picture = picture*dataset_stddev+dataset_mean
             picture = gridify(picture)
             picture = tf.cast(tf.clip_by_value(((picture+1.0)*0.5)*255.0,0.0,255.0),dtype=tf.uint8)
+            
+            if picture.shape[-1] == 1:
+                picture = tf.squeeze(picture,axis=-1)
             
             im = Image.fromarray(picture.numpy())
             im.save(f"outs/sess{training_sess_id}_{step}.png")
