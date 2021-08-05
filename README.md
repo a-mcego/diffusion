@@ -8,6 +8,10 @@ https://arxiv.org/pdf/2102.09672.pdf
 
 https://arxiv.org/pdf/2105.05233.pdf
 
-Not even MNIST works properly yet, result at 76k steps:
+Currently, only the first paper is implemented, mostly.
 
-![Example of generated MNIST at 76k steps](https://github.com/a-mcego/diffusion/blob/main/sess22544745_76800.png)
+MNIST almost works:
+
+![Example of generated MNIST at 76k steps](https://github.com/a-mcego/diffusion/blob/main/sess952304671_24576.png)
+
+Some of the digits are way too thick, some are way too thin. Otherwise it seems to be working well.
