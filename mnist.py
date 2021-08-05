@@ -42,18 +42,18 @@ def get_mnist_pics_only():
     return tf.expand_dims(tf.cast(tf.concat([x,y],axis=0),dtype=tf.float32)*(1.0/255.0)*2.0-1.0,axis=-1)
 import glob
 
-def get_pngs_from_directory(directory):
-    pngs = glob.glob(f"{directory}/*.png")
+def get_files_from_directory(directory, extension):
+    pngs = glob.glob(f"{directory}/*.{extension}")
     imgs = [tf.io.decode_png(tf.io.read_file(png)) for png in pngs]
     imgs = tf.stack(imgs,axis=0)
     imgs = tf.cast(imgs,dtype=tf.float32)*(1.0/255.0)*2.0-1.0
     return imgs
 
-#dataset = get_mnist_pics_only()
-#dataset = tf.pad(dataset, [[0,0],[2,2],[2,2],[0,0]], constant_values = -1.0) #pad to 32x32
+dataset = get_mnist_pics_only()
+dataset = tf.pad(dataset, [[0,0],[2,2],[2,2],[0,0]], constant_values = -1.0) #pad to 32x32
 
-dataset = get_pngs_from_directory("Q:\\doom\\out")
-dataset = tf.pad(dataset,[[0,0],[0,8],[0,0],[0,0]],constant_values=-1.0) #pad to 128x80
+#dataset = get_files_from_directory("Q:\\doom\\out", "png")
+#dataset = tf.pad(dataset,[[0,0],[0,8],[0,0],[0,0]],constant_values=-1.0) #pad to 128x80
 
 dataset_stddev = tf.math.reduce_std(dataset,axis=[0,1,2],keepdims=True)
 dataset_mean = tf.math.reduce_mean(dataset,axis=[0,1,2],keepdims=True)
@@ -71,9 +71,8 @@ prm['BATCH_SIZE'] = 32
 prm['LEARNING_RATE_START'] = 0.001
 prm['LEARNING_RATE_MIN'] = 0.0001
 prm['ADAM_EPSILON'] = 1e-4
-prm['N_TEST_GENERATIONS'] = 9
-prm['USE_RANGE_SHUFFLER'] = True
-prm['PRINT_TIME'] = 32 #how many steps between prints
+prm['N_TEST_GENERATIONS'] = 49
+prm['PRINT_TIME'] = 256 #how many steps between prints
 prm['GENERATE_TIME'] = prm['PRINT_TIME']*8 # how many steps between generated outputs saved to .png
 prm['USE_TIMESTEP_EMBEDDINGS'] = True
 prm['USE_IMAGE_POSENC'] = False
@@ -262,20 +261,15 @@ training_sess_id = str(random.randrange(1000000000))
 
 losses = []
 
-if prm['USE_RANGE_SHUFFLER']:
-    data_shuffler = RangeShuffler(0,dataset.shape[0])
-    timestep_shuffler = RangeShuffler(1,prm['N_STEPS']+1)
+data_shuffler = RangeShuffler(0,dataset.shape[0])
+timestep_shuffler = RangeShuffler(1,prm['N_STEPS']+1)
 
 starttime = time.time()
 
 #training loop:
 while True:
-    if prm['USE_RANGE_SHUFFLER']:
-        ids = data_shuffler.get_batch(prm['BATCH_SIZE'])
-        timestep_ids = timestep_shuffler.get_batch(prm['BATCH_SIZE'])
-    else:
-        ids = tf.random.uniform(shape=[prm['BATCH_SIZE']], maxval=dataset.shape[0], dtype=tf.int64)
-        timestep_ids = tf.random.uniform(shape=[prm['BATCH_SIZE']], minval=1, maxval=prm['N_STEPS']+1, dtype=tf.int64)
+    ids = data_shuffler.get_batch(prm['BATCH_SIZE'])
+    timestep_ids = timestep_shuffler.get_batch(prm['BATCH_SIZE'])
     
     originals = tf.gather(dataset, ids)
     
