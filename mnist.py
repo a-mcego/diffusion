@@ -12,11 +12,19 @@ import matplotlib.pyplot as plt
 import random
 
 import posenc
+import glob
+import datasets
 
 from PIL import Image
 
 if not os.path.exists("outs"):
     os.mkdir("outs")
+
+def jsonload(filename):
+    return json.load(open(filename,"r"))
+    
+def jsonsave(obj, filename):
+    json.dump(obj, open(filename, "w"))
 
 class RangeShuffler:
     def __init__(self, minval, maxval):
@@ -35,34 +43,23 @@ class RangeShuffler:
         ret = self.current[:batch_size]
         self.current = self.current[batch_size:]
         return ret
+        
+    def get_state(self):
+        return self.current.numpy()
+        
+    def set_state(self, s):
+        self.current = tf.convert_to_tensor(s)
 
-#returns float32, pixel colors in range [-1.0,1.0]
-def get_mnist_pics_only():
-    (x,_),(y,_) = tf.keras.datasets.mnist.load_data()
-    return tf.expand_dims(tf.cast(tf.concat([x,y],axis=0),dtype=tf.float32)*(1.0/255.0)*2.0-1.0,axis=-1)
-import glob
+#dataset = datasets.MNIST()
 
-def get_files_from_directory(directory, extension):
-    pngs = glob.glob(f"{directory}/*.{extension}")
-    imgs = [tf.io.decode_png(tf.io.read_file(png)) for png in pngs]
-    imgs = tf.stack(imgs,axis=0)
-    imgs = tf.cast(imgs,dtype=tf.float32)*(1.0/255.0)*2.0-1.0
-    return imgs
+#dataset = datasets.Directory("Q:\\doom\\out", "png", pad=[[0,0],[0,8],[0,0],[0,0]])
 
-dataset = get_mnist_pics_only()
-dataset = tf.pad(dataset, [[0,0],[2,2],[2,2],[0,0]], constant_values = -1.0) #pad to 32x32
-
-#dataset = get_files_from_directory("Q:\\doom\\out", "png")
-#dataset = tf.pad(dataset,[[0,0],[0,8],[0,0],[0,0]],constant_values=-1.0) #pad to 128x80
-
-dataset_stddev = tf.math.reduce_std(dataset,axis=[0,1,2],keepdims=True)
-dataset_mean = tf.math.reduce_mean(dataset,axis=[0,1,2],keepdims=True)
-dataset = (dataset-dataset_mean)/dataset_stddev
+dataset = datasets.UltimateDoom("c:\\datasets\\ultimate_doom.npy", pad=[[0,0],[0,8],[0,0],[0,0]])
 
 print(f"Dataset shape: {dataset.shape}")
 
 prm = {} #parameters
-prm['N_STEPS'] = 199 #how many diffusion steps we use
+prm['N_GENERATE_STEPS'] = 399 #how many diffusion steps we use
 prm['SIZE_Y'] = dataset.shape[-3]
 prm['SIZE_X'] = dataset.shape[-2]
 prm['CHANNELS'] = dataset.shape[-1]
@@ -71,39 +68,45 @@ prm['BATCH_SIZE'] = 32
 prm['LEARNING_RATE_START'] = 0.001
 prm['LEARNING_RATE_MIN'] = 0.0001
 prm['ADAM_EPSILON'] = 1e-4
-prm['N_TEST_GENERATIONS'] = 49
-prm['PRINT_TIME'] = 256 #how many steps between prints
+prm['N_TEST_GENERATIONS'] = 9
+prm['PRINT_TIME'] = 128 #how many steps between prints
 prm['GENERATE_TIME'] = prm['PRINT_TIME']*8 # how many steps between generated outputs saved to .png
-prm['USE_TIMESTEP_EMBEDDINGS'] = True
-prm['USE_IMAGE_POSENC'] = False
+prm['N_BUCKETS'] = 1024#prm['BATCH_SIZE']
+prm['USE_BUCKETS'] = True
+
+prm['MODEL_SAVE_DIR'] = "Q:\\model_saves"
+prm['MODEL_SAVE_TIME'] = prm['PRINT_TIME']*32 #how many steps between model saves.
 
 for key in prm:
     print(f"{key}={prm[key]} ",end="")
 print()
 
 class NoisingProcess:
+    def curvify(self, x):
+        #sqrt() so that when we add the two kinds of noise together,
+        #we get an image that has stddev=1
+        return tf.math.sqrt(x)
+
     def __init__(self, timesteps):
         self.timesteps = timesteps
         
-        #sqrt() so that when we add the two kinds of noise together,
-        #we get an image that has stddev=1
-        self.image_coef = tf.math.sqrt(tf.linspace(start=1.0, stop=0.0, num=timesteps+1))
-        self.noise_coef = tf.math.sqrt(tf.linspace(start=0.0, stop=1.0, num=timesteps+1))
+        self.image_coef = self.curvify(tf.linspace(start=1.0, stop=0.0, num=timesteps+1))
+        self.noise_coef = self.curvify(tf.linspace(start=0.0, stop=1.0, num=timesteps+1))
+        
+    def get_continuous_learning_batch(batch_size):
+        return self.curvify(tf.random.uniform([batch_size], minval=0.0, maxval=1.0))
 
-    def direct(self, step, image, noise=None):
-        assert step>=0 and step<=self.timesteps
-        
-        if noise is None:
-            noise = tf.random.normal(shape=image.shape, stddev=1.0)
-        
-        ret = self.image_coef[step]*image + noise*self.noise_coef[step]
+    def direct_continuous(self, step, image):
+        assert step>=0.0 and step<=1.0
+        noise_c = self.curvify(step)
+        image_c = self.curvify(1.0-step)
+        noise = tf.random.normal(shape=image.shape, stddev=1.0)
+        ret = image*image_c + noise*noise_c
         return ret, noise
+
         
     def get_noise_stddev_for_step(self, step):
         return self.noise_coef[step]
-        
-    def get_image_stddev_for_step(self, step):
-        return self.image_coef[step]
 
 
 def reduce(matrix, axis):
@@ -144,7 +147,6 @@ class MultiConv(tf.keras.Model):
             orig = output
             output = pad_image_repeat(output, self.filter_size//2)
             output = orig+layer(output)
-            #output = layer(output)
             output = normalize_features(output)
         return output
         
@@ -152,10 +154,16 @@ class MultiConv(tf.keras.Model):
 class NoisePredictorUNet(tf.keras.Model):
     def __init__(self):
         super(NoisePredictorUNet,self).__init__()
-
+        
         #layer amount hardcoded for now
-        self.features = [64,128,256,512,1024,512,256,128,64]
-        self.concat   = [-1, -1, -1, -1,  -1,  3,  2,  1, 0]
+        self.features = [64,128,256,512,512,512,256,128,64]
+        self.concat   = [-1, -1, -1, -1, -1,  3,  2,  1, 0]
+        
+        #self.features = [64,128,256,512,256,128,64]
+        #self.concat   = [-1, -1, -1, -1,  2,  1, 0]
+
+        #self.features = [64,128,64]
+        #self.concat   = [-1, -1, 0]
         
         self.n_layers = len(self.features)
         
@@ -167,17 +175,13 @@ class NoisePredictorUNet(tf.keras.Model):
         self.samples.extend(upsamples)
         self.samples.extend([None])
 
-        if prm['USE_TIMESTEP_EMBEDDINGS']:
-            self.timestep_posenc = posenc.get_zero_to_one_posenc(prm['N_STEPS'], self.features[0])
-        
         self.image_posenc = tf.keras.layers.Embedding(prm['SIZE_X']*prm['SIZE_Y'], self.features[0])
         self.prologue = tf.keras.layers.Conv2D(self.features[0], (1,1), use_bias=False)
         self.convs = [MultiConv(self.features[n]) for n in range(self.n_layers)]
         self.epilogue = tf.keras.layers.Conv2D(prm['CHANNELS'], (1,1), use_bias=False)
 
-    def call(self, data, timestep_ns):
+    def call(self, data):
         #data shape:        BATCH, SIZEY, SIZEX, CHANNELS
-        #timestep_ns shape: BATCH
         
         orig_input = data
         
@@ -186,14 +190,6 @@ class NoisePredictorUNet(tf.keras.Model):
         output = data
         output = self.prologue(output)
         
-        if prm['USE_TIMESTEP_EMBEDDINGS']:
-            timesteps = tf.gather(self.timestep_posenc, timestep_ns)
-            #shape: BATCH, MODEL_SIZE
-            timesteps = tf.expand_dims(timesteps,axis=1)
-            timesteps = tf.expand_dims(timesteps,axis=1)
-            #shape: BATCH, 1, 1, MODEL_SIZE
-            output += timesteps
-
         image_posenc = self.image_posenc(tf.range(prm['SIZE_X']*prm['SIZE_Y'],dtype=tf.int64))
         #image_posenc shape: 784, 256
         image_posenc = tf.reshape(image_posenc, [1,prm['SIZE_Y'],prm['SIZE_X'],self.features[0]])
@@ -226,15 +222,15 @@ def lr_scheduler():
     return max(minimum,calculated)
 
 optimizer = tf.keras.optimizers.Adam(learning_rate=lr_scheduler,amsgrad=True,epsilon=prm['ADAM_EPSILON'])
-noising_process = NoisingProcess(prm['N_STEPS'])
+noising_process = NoisingProcess(prm['N_GENERATE_STEPS'])
 noise_predictor = NoisePredictorUNet()
 
 @tf.function
-def do_step(inputdata, timesteps, target):
+def do_step(inputdata, target):
     losses = []
     
     with tf.GradientTape() as tape:
-        output = noise_predictor(inputdata, timesteps)
+        output = noise_predictor(inputdata)
         loss = tf.reduce_mean(tf.square(target-output))
         losses.append(loss)
     gradients = tape.gradient(losses, noise_predictor.trainable_variables, unconnected_gradients=tf.UnconnectedGradients.ZERO)
@@ -262,30 +258,45 @@ training_sess_id = str(random.randrange(1000000000))
 losses = []
 
 data_shuffler = RangeShuffler(0,dataset.shape[0])
-timestep_shuffler = RangeShuffler(1,prm['N_STEPS']+1)
+bucket_shuffler = RangeShuffler(0, prm['N_BUCKETS'])
 
 starttime = time.time()
+
+if os.path.isfile(prm['MODEL_SAVE_DIR']+'/settings.txt'):
+    settings = jsonload(prm['MODEL_SAVE_DIR']+'/settings.txt')
+    
+    checkpoint = tf.train.Checkpoint(opt=optimizer, noisepred=noise_predictor)
+    status = checkpoint.restore(tf.train.latest_checkpoint(prm['MODEL_SAVE_DIR']+'/weights'))
+    
+    step = settings['step']
+    data_shuffler.set_state(np.array(settings['data_shuffler_state'],dtype=np.int64))
+    bucket_shuffler.set_state(np.array(settings['bucket_shuffler_state'],dtype=np.int64))
+    training_sess_id = settings['training_sess_id']
 
 #training loop:
 while True:
     ids = data_shuffler.get_batch(prm['BATCH_SIZE'])
-    timestep_ids = timestep_shuffler.get_batch(prm['BATCH_SIZE'])
     
-    originals = tf.gather(dataset, ids)
+    if prm['USE_BUCKETS']:        
+        timestep_vals = bucket_shuffler.get_batch(prm['BATCH_SIZE'])
+        timestep_vals = tf.cast(timestep_vals,dtype=tf.float32)*(1.0/float(prm['N_BUCKETS']))
+        timestep_vals += tf.random.uniform(shape=timestep_vals.shape, minval=0.0, maxval=1.0/float(prm['N_BUCKETS']))
+    else:
+        timestep_vals = tf.random.uniform(shape=[prm['BATCH_SIZE']], minval=0.0,maxval=1.0)
+    
+    originals = dataset.gather(ids)
     
     targets = []
     batch = []
-    
     for ex_id in range(prm['BATCH_SIZE']):
-        ex, target = noising_process.direct(timestep_ids[ex_id], originals[ex_id])
-        
+        ex, target = noising_process.direct_continuous(timestep_vals[ex_id], originals[ex_id])
         batch.append(ex)
         targets.append(target)
     
     batch = tf.stack(batch,axis=0)
     targets = tf.stack(targets,axis=0)
     
-    losses.extend(do_step(batch, timestep_ids, targets))
+    losses.extend(do_step(batch, targets))
     
     if step % prm['PRINT_TIME'] == 0:
     
@@ -305,17 +316,20 @@ while True:
             n_gen = prm['N_TEST_GENERATIONS']
 
             picture = tf.random.normal(shape=[n_gen,dataset.shape[1],dataset.shape[2],dataset.shape[3]], stddev=1.0, mean=0.0)
-            for ts in range(prm['N_STEPS'], 0, -1):
-                ts_tf = tf.expand_dims(tf.convert_to_tensor(ts),axis=0)
-                ts_tf = tf.broadcast_to(ts_tf,[picture.shape[0]])
-                
+            ts_tf = tf.convert_to_tensor(prm['N_GENERATE_STEPS'])
+            
+            @tf.function
+            def ret_pic(picture, oldnoise, newnoise):
+                denoised_picture = picture-noise_predictor(picture)*oldnoise
+                picture = denoised_picture + tf.random.normal(shape=picture.shape, mean=0.0, stddev=newnoise)
+                return picture
+            
+            for ts in range(prm['N_GENERATE_STEPS'], 0, -1):
                 oldnoise = noising_process.get_noise_stddev_for_step(ts)
                 newnoise = noising_process.get_noise_stddev_for_step(ts-1)
+                picture = ret_pic(picture, oldnoise, newnoise)
                 
-                denoised_picture = picture-noise_predictor(picture, ts_tf)*oldnoise
-                picture = denoised_picture + tf.random.normal(shape=picture.shape, mean=0, stddev=newnoise)
-                
-            picture = picture*dataset_stddev+dataset_mean
+            picture = picture*dataset.stddev+dataset.mean
             picture = gridify(picture)
             picture = tf.cast(tf.clip_by_value(((picture+1.0)*0.5)*255.0,0.0,255.0),dtype=tf.uint8)
             
@@ -325,4 +339,21 @@ while True:
             im = Image.fromarray(picture.numpy())
             im.save(f"outs/sess{training_sess_id}_{step}.png")
     
+
+    if step % prm['MODEL_SAVE_TIME'] == 0:
+        checkpoint = tf.train.Checkpoint(opt=optimizer, noisepred=noise_predictor)
+        ckptfolder = checkpoint.save(file_prefix=prm['MODEL_SAVE_DIR']+'/weights/ckpt')
+        
+        sets = {
+            'step':step+1, 
+            'folder':ckptfolder, 
+            'data_shuffler_state':data_shuffler.get_state().tolist(), 
+            'bucket_shuffler_state':bucket_shuffler.get_state().tolist(),
+            'training_sess_id': training_sess_id
+        }
+        
+        jsonsave(sets, prm['MODEL_SAVE_DIR']+'/settings.txt')
+        
+        print("Saved.", end="    \r")
+        
     step += 1
